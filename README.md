@@ -5,4 +5,4 @@ Requires importing matplotlib, numpy, scipy.spatial.distance.
 
 Code has been altered in such a way that the default axes created by matplotlib has been hidden to give it better aesthetics.
 
-![alt text](http://url/to/Capture.PNG)
+![Screenshot](http://url/to/Capture.PNG)
