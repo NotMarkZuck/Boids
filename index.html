@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Murmuration Camera</title>
+<style>
+  :root {
+    --ink: #1a1a1a;
+    --muted: #6b7280;
+    --accent: #178a3a;
+    --panel: rgba(255,255,255,0.82);
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%;
+    background: #fff; color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    overflow: hidden;
+  }
+  #stage { position: fixed; inset: 0; display: grid; place-items: center; background: #fff; }
+  canvas#scene { display: block; width: 100%; height: 100%; background: #fff; }
+
+  /* Hidden work surfaces */
+  video, canvas#mask { display: none; }
+
+  /* HUD */
+  #badge {
+    position: fixed; left: 16px; bottom: 16px;
+    font-weight: 700; letter-spacing: .04em; font-size: 15px;
+    color: var(--muted);
+    padding: 6px 12px; border-radius: 999px;
+    background: var(--panel); backdrop-filter: blur(6px);
+    box-shadow: 0 1px 4px rgba(0,0,0,.08);
+  }
+  #badge.forming { color: #fff; background: var(--accent); }
+
+  #stats {
+    position: fixed; left: 16px; top: 14px;
+    font-size: 12.5px; color: var(--muted);
+    background: var(--panel); backdrop-filter: blur(6px);
+    padding: 6px 10px; border-radius: 8px;
+  }
+
+  #panel {
+    position: fixed; right: 16px; top: 14px;
+    display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    background: var(--panel); backdrop-filter: blur(6px);
+    padding: 8px 10px; border-radius: 10px;
+    box-shadow: 0 1px 4px rgba(0,0,0,.08);
+  }
+  #panel button, #panel label {
+    font-size: 12.5px; color: var(--ink);
+    background: #fff; border: 1px solid #e5e7eb; border-radius: 7px;
+    padding: 6px 9px; cursor: pointer; user-select: none;
+  }
+  #panel button:hover { border-color: #cbd5e1; }
+  #panel label { display: flex; align-items: center; gap: 6px; cursor: default; }
+  #panel input[type=range] { width: 90px; }
+
+  /* Preview thumbnail */
+  #preview {
+    position: fixed; right: 16px; bottom: 16px;
+    width: 220px; border-radius: 10px; overflow: hidden;
+    box-shadow: 0 2px 10px rgba(0,0,0,.18); display: none;
+    border: 2px solid #fff; background:#000;
+  }
+  #preview.show { display: block; }
+  #preview canvas { display: block; width: 100%; }
+
+  /* Start / status overlay */
+  #overlay {
+    position: fixed; inset: 0; display: grid; place-items: center;
+    background: rgba(255,255,255,.94); z-index: 10; text-align: center; padding: 24px;
+  }
+  #overlay.hidden { display: none; }
+  #overlay .card { max-width: 460px; }
+  #overlay h1 { font-size: 26px; margin: 0 0 8px; }
+  #overlay p { color: var(--muted); line-height: 1.5; margin: 8px 0 20px; }
+  #start {
+    font-size: 16px; font-weight: 600; color: #fff; background: var(--ink);
+    border: 0; border-radius: 10px; padding: 12px 22px; cursor: pointer;
+  }
+  #start:hover { background: #000; }
+  #err { color: #b91c1c; font-size: 13px; margin-top: 14px; min-height: 18px; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 14px; }
+</style>
+</head>
+<body>
+  <div id="stage">
+    <canvas id="scene"></canvas>
+  </div>
+
+  <div id="stats">starting…</div>
+  <div id="badge">FREE FLIGHT</div>
+
+  <div id="panel">
+    <button id="pause">Pause</button>
+    <button id="form">Formation: on</button>
+    <button id="prev">Preview</button>
+    <label>Birds <input id="count" type="range" min="80" max="900" step="20" value="450"></label>
+  </div>
+
+  <div id="preview"><canvas id="pvcanvas"></canvas></div>
+
+  <video id="video" playsinline muted></video>
+  <canvas id="mask"></canvas>
+
+  <div id="overlay">
+    <div class="card">
+      <h1>Murmuration Camera</h1>
+      <p>A flock of birds murmurates on a white screen. Step in front of your
+         camera and the swarm reorganises into your silhouette.</p>
+      <button id="start">Enable camera &amp; start</button>
+      <div id="err"></div>
+      <div class="hint">Everything runs in your browser — the camera feed never leaves this page.</div>
+    </div>
+  </div>
+
+<!-- MediaPipe Selfie Segmentation (client-side human silhouette) -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js" crossorigin="anonymous"></script>
+<script>
+"use strict";
+(function () {
+  // ---------------------------------------------------------------
+  // DOM
+  // ---------------------------------------------------------------
+  const scene   = document.getElementById("scene");
+  const ctx     = scene.getContext("2d");
+  const video   = document.getElementById("video");
+  const maskCv  = document.getElementById("mask");
+  const maskCtx = maskCv.getContext("2d", { willReadFrequently: true });
+  const pvCv    = document.getElementById("pvcanvas");
+  const pvCtx   = pvCv.getContext("2d");
+  const badge   = document.getElementById("badge");
+  const stats   = document.getElementById("stats");
+  const overlay = document.getElementById("overlay");
+  const errEl   = document.getElementById("err");
+
+  const MW = 256, MH = 256;          // mask working resolution
+  maskCv.width = MW; maskCv.height = MH;
+
+  // ---------------------------------------------------------------
+  // Flock (Reynolds boids) in typed arrays
+  // ---------------------------------------------------------------
+  const Flock = {
+    n: 0,
+    px: null, py: null, vx: null, vy: null,
+    tx: null, ty: null, hasTarget: false, blend: 0,
+    formationOn: true,
+    W: 0, H: 0,
+
+    // tuning
+    sepR: 16, alignR: 42, cohR: 58,
+    sepW: 1.1, alignW: 0.35, cohW: 0.28,
+    maxSpeed: 4.6, maxForce: 0.35,
+    formW: 1.1,
+
+    init(n, W, H) {
+      this.W = W; this.H = H;
+      this.n = n;
+      this.px = new Float32Array(n); this.py = new Float32Array(n);
+      this.vx = new Float32Array(n); this.vy = new Float32Array(n);
+      this.tx = new Float32Array(n); this.ty = new Float32Array(n);
+      for (let i = 0; i < n; i++) {
+        this.px[i] = W * (0.2 + 0.6 * Math.random());
+        this.py[i] = H * (0.2 + 0.6 * Math.random());
+        const a = Math.random() * Math.PI * 2;
+        this.vx[i] = Math.cos(a) * 3; this.vy[i] = Math.sin(a) * 3;
+      }
+      this.hasTarget = false; this.blend = 0;
+    },
+
+    setCount(n) {
+      if (n === this.n) return;
+      const on = this.formationOn;
+      this.init(n, this.W, this.H);
+      this.formationOn = on;
+    },
+
+    resize(W, H) { this.W = W; this.H = H; },
+
+    // targets: Float32Array of interleaved [x,y,...] sampled from silhouette
+    setTargets(pts) {
+      if (!pts || pts.length === 0) { this.hasTarget = false; return; }
+      const m = pts.length / 2;
+      // each bird -> nearest of a random subset of targets (keeps it cheap)
+      const K = Math.min(m, 220);
+      const sx = new Float32Array(K), sy = new Float32Array(K);
+      for (let k = 0; k < K; k++) {
+        const j = (Math.random() * m) | 0;
+        sx[k] = pts[j * 2]; sy[k] = pts[j * 2 + 1];
+      }
+      for (let i = 0; i < this.n; i++) {
+        let best = 0, bd = Infinity;
+        const x = this.px[i], y = this.py[i];
+        for (let k = 0; k < K; k++) {
+          const dx = x - sx[k], dy = y - sy[k];
+          const d = dx * dx + dy * dy;
+          if (d < bd) { bd = d; best = k; }
+        }
+        this.tx[i] = sx[best]; this.ty[i] = sy[best];
+      }
+      this.hasTarget = true;
+    },
+
+    step() {
+      const n = this.n;
+      const px = this.px, py = this.py, vx = this.vx, vy = this.vy;
+      const sepR2 = this.sepR * this.sepR;
+      const alignR2 = this.alignR * this.alignR;
+      const cohR2 = this.cohR * this.cohR;
+
+      const want = (this.formationOn && this.hasTarget) ? 1 : 0;
+      this.blend += (want - this.blend) * 0.08;
+      const blend = this.blend;
+
+      for (let i = 0; i < n; i++) {
+        let sepx = 0, sepy = 0;
+        let avx = 0, avy = 0, ac = 0;
+        let cx = 0, cy = 0, cc = 0;
+        const xi = px[i], yi = py[i];
+
+        for (let j = 0; j < n; j++) {
+          if (j === i) continue;
+          const dx = xi - px[j], dy = yi - py[j];
+          const d2 = dx * dx + dy * dy;
+          if (d2 > cohR2) continue;
+          if (d2 < sepR2 && d2 > 0.0001) { sepx += dx / d2; sepy += dy / d2; }
+          if (d2 < alignR2) { avx += vx[j]; avy += vy[j]; ac++; }
+          cx += px[j]; cy += py[j]; cc++;
+        }
+
+        let ax = 0, ay = 0;
+        // separation
+        ax += clampMag(sepx, sepy, this.maxForce)[0] * this.sepW;
+        ay += clampMag(sepx, sepy, this.maxForce)[1] * this.sepW;
+        // alignment
+        if (ac > 0) {
+          const al = clampMag(avx / ac - vx[i], avy / ac - vy[i], this.maxForce);
+          ax += al[0] * this.alignW; ay += al[1] * this.alignW;
+        }
+        // cohesion
+        if (cc > 0) {
+          const co = clampMag(cx / cc - xi, cy / cc - yi, this.maxForce);
+          ax += co[0] * this.cohW; ay += co[1] * this.cohW;
+        }
+
+        // formation blend
+        if (blend > 0.01 && this.hasTarget) {
+          const st = clampMag(this.tx[i] - xi, this.ty[i] - yi, this.maxForce * 6);
+          ax = ax * (1 - blend) + st[0] * this.formW * blend;
+          ay = ay * (1 - blend) + st[1] * this.formW * blend;
+        }
+
+        vx[i] += ax; vy[i] += ay;
+        // speed limit
+        let sp = Math.hypot(vx[i], vy[i]);
+        if (sp > this.maxSpeed) { vx[i] = vx[i] / sp * this.maxSpeed; vy[i] = vy[i] / sp * this.maxSpeed; }
+        else if (sp < 0.4) { vx[i] += (Math.random() - 0.5) * 0.5; vy[i] += (Math.random() - 0.5) * 0.5; }
+      }
+
+      // integrate + wrap
+      const W = this.W, H = this.H, m = 8;
+      for (let i = 0; i < n; i++) {
+        px[i] += vx[i]; py[i] += vy[i];
+        if (px[i] < -m) px[i] = W + m; else if (px[i] > W + m) px[i] = -m;
+        if (py[i] < -m) py[i] = H + m; else if (py[i] > H + m) py[i] = -m;
+      }
+    },
+
+    draw(g) {
+      const n = this.n, forming = this.formationOn && this.hasTarget;
+      g.fillStyle = forming ? "#202020" : "#3c3c3c";
+      g.beginPath();
+      for (let i = 0; i < n; i++) {
+        let hx = this.vx[i], hy = this.vy[i];
+        const sp = Math.hypot(hx, hy) || 1; hx /= sp; hy /= sp;
+        const perpx = -hy, perpy = hx;
+        const x = this.px[i], y = this.py[i], s = 4.6;
+        const tipx = x + hx * s * 1.7,   tipy = y + hy * s * 1.7;
+        const lx = x - hx * s + perpx * s * 0.85, ly = y - hy * s + perpy * s * 0.85;
+        const rx = x - hx * s - perpx * s * 0.85, ry = y - hy * s - perpy * s * 0.85;
+        g.moveTo(tipx, tipy); g.lineTo(lx, ly); g.lineTo(rx, ry); g.closePath();
+      }
+      g.fill();
+    }
+  };
+
+  const _cm = [0, 0];
+  function clampMag(x, y, max) {
+    const m = Math.hypot(x, y);
+    if (m > max && m > 0) { _cm[0] = x / m * max; _cm[1] = y / m * max; }
+    else { _cm[0] = x; _cm[1] = y; }
+    return _cm;
+  }
+
+  // ---------------------------------------------------------------
+  // Silhouette -> target points
+  // Reads the mask canvas, keeps outline + interior, maps to scene space.
+  // ---------------------------------------------------------------
+  let lastPoints = null;
+  let coverage = 0;
+
+  function sampleTargets() {
+    const img = maskCtx.getImageData(0, 0, MW, MH).data;
+    // foreground test on red channel (mask drawn as white on black)
+    const fg = (x, y) => img[(y * MW + x) * 4] > 128;
+
+    const edge = [];
+    const fill = [];
+    let fgCount = 0;
+    // step by 2 for speed
+    for (let y = 1; y < MH - 1; y += 2) {
+      for (let x = 1; x < MW - 1; x += 2) {
+        if (!fg(x, y)) continue;
+        fgCount++;
+        const isEdge = !fg(x - 1, y) || !fg(x + 1, y) || !fg(x, y - 1) || !fg(x, y + 1);
+        (isEdge ? edge : fill).push(x, y);
+      }
+    }
+    coverage = fgCount / ((MW * MH) / 4);
+    if (coverage < 0.015 || (edge.length === 0 && fill.length === 0)) {
+      lastPoints = null;
+      return null;
+    }
+
+    const sx = Flock.W / MW, sy = Flock.H / MH;
+    const nEdge = Math.floor(Flock.n * 2.2);
+    const nFill = Flock.n;
+    const out = new Float32Array((nEdge + nFill) * 2);
+    let o = 0;
+    const draw = (arr, k) => {
+      const m = arr.length / 2;
+      if (m === 0) return;
+      for (let i = 0; i < k; i++) {
+        const j = (Math.random() * m) | 0;
+        out[o++] = arr[j * 2] * sx;
+        out[o++] = arr[j * 2 + 1] * sy;
+      }
+    };
+    draw(edge, nEdge);
+    draw(fill, nFill);
+    lastPoints = out.subarray(0, o);
+    return lastPoints;
+  }
+
+  // ---------------------------------------------------------------
+  // Rendering loop
+  // ---------------------------------------------------------------
+  let paused = false, showPreview = false, frame = 0;
+  let fps = 0, lastT = performance.now();
+
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    scene.width = Math.floor(window.innerWidth * dpr);
+    scene.height = Math.floor(window.innerHeight * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    Flock.resize(window.innerWidth, window.innerHeight);
+  }
+  window.addEventListener("resize", resize);
+
+  function render() {
+    requestAnimationFrame(render);
+    const now = performance.now();
+    const dt = now - lastT; lastT = now;
+    if (dt > 0) fps = fps * 0.9 + (1000 / dt) * 0.1;
+
+    if (!paused) Flock.step();
+
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
+    Flock.draw(ctx);
+
+    const forming = Flock.formationOn && Flock.hasTarget;
+    badge.textContent = forming ? "FORMING SILHOUETTE" : "FREE FLIGHT";
+    badge.classList.toggle("forming", forming);
+    stats.textContent = `birds ${Flock.n} · ${fps.toFixed(0)} fps · body ${(coverage * 100).toFixed(0)}%`;
+    frame++;
+  }
+
+  // ---------------------------------------------------------------
+  // MediaPipe results -> mask canvas
+  // ---------------------------------------------------------------
+  function onResults(res) {
+    // Draw the segmentation mask (white person on black) into maskCv.
+    maskCtx.save();
+    maskCtx.clearRect(0, 0, MW, MH);
+    maskCtx.fillStyle = "#000";
+    maskCtx.fillRect(0, 0, MW, MH);
+    if (res.segmentationMask) {
+      maskCtx.drawImage(res.segmentationMask, 0, 0, MW, MH);
+      // Threshold to hard white where person, using multiply against white.
+      // (drawImage already yields high alpha/white on person, dark elsewhere.)
+    }
+    maskCtx.restore();
+
+    // Rebuild targets a few times per second.
+    if (frame % 4 === 0) {
+      const pts = sampleTargets();
+      Flock.setTargets(pts);
+      if (!pts) Flock.hasTarget = false;
+    }
+
+    if (showPreview) {
+      pvCv.width = 220; pvCv.height = Math.round(220 * (video.videoHeight / video.videoWidth || 0.75));
+      pvCtx.drawImage(video, 0, 0, pvCv.width, pvCv.height);
+      pvCtx.globalAlpha = 0.45; pvCtx.drawImage(maskCv, 0, 0, pvCv.width, pvCv.height);
+      pvCtx.globalAlpha = 1;
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // Boot
+  // ---------------------------------------------------------------
+  async function start() {
+    errEl.textContent = "";
+    if (typeof SelfieSegmentation === "undefined") {
+      errEl.textContent = "Could not load the segmentation library (offline or blocked). This page must be served over the web, not opened as a sandboxed file.";
+      return;
+    }
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
+        audio: false
+      });
+    } catch (e) {
+      errEl.textContent = "Camera access was denied or unavailable. Allow the camera and reload. (The camera needs an https:// page.)";
+      return;
+    }
+
+    video.srcObject = stream;
+    await video.play();
+
+    resize();
+    Flock.init(parseInt(document.getElementById("count").value, 10), Flock.W, Flock.H);
+
+    const seg = new SelfieSegmentation({
+      locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${f}`
+    });
+    seg.setOptions({ modelSelection: 1, selfieMode: true });
+    seg.onResults(onResults);
+
+    // Pump frames to MediaPipe.
+    async function pump() {
+      if (video.readyState >= 2) {
+        try { await seg.send({ image: video }); } catch (e) { /* transient */ }
+      }
+      requestAnimationFrame(pump);
+    }
+    pump();
+    render();
+
+    overlay.classList.add("hidden");
+  }
+
+  // ---------------------------------------------------------------
+  // Controls
+  // ---------------------------------------------------------------
+  document.getElementById("start").addEventListener("click", start);
+  document.getElementById("pause").addEventListener("click", (e) => {
+    paused = !paused; e.target.textContent = paused ? "Resume" : "Pause";
+  });
+  document.getElementById("form").addEventListener("click", (e) => {
+    Flock.formationOn = !Flock.formationOn;
+    e.target.textContent = "Formation: " + (Flock.formationOn ? "on" : "off");
+  });
+  document.getElementById("prev").addEventListener("click", () => {
+    showPreview = !showPreview;
+    document.getElementById("preview").classList.toggle("show", showPreview);
+  });
+  document.getElementById("count").addEventListener("input", (e) => {
+    Flock.setCount(parseInt(e.target.value, 10));
+  });
+  window.addEventListener("keydown", (e) => {
+    if (e.key === " ") { document.getElementById("pause").click(); e.preventDefault(); }
+    else if (e.key === "f") document.getElementById("form").click();
+    else if (e.key === "m") document.getElementById("prev").click();
+  });
+
+  // Draw a gentle idle flock behind the overlay so the page isn't blank.
+  resize();
+  Flock.init(300, Flock.W, Flock.H);
+  (function idle() {
+    if (!overlay.classList.contains("hidden")) {
+      Flock.step();
+      ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
+      Flock.draw(ctx);
+      requestAnimationFrame(idle);
+    }
+  })();
+})();
+</script>
+</body>
+</html>
