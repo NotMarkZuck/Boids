@@ -2,16 +2,51 @@
 
 A [Boids](http://www.red3d.com/cwr/boids/) murmuration playground in Python.
 
-This repo now contains **two** things:
+This repo now contains **three** things:
 
 | File | What it is |
 | --- | --- |
+| `index.html` | **Web version** — the murmuration + camera silhouette running entirely in the browser. Nothing to install; host it and open it. |
+| `murmuration_camera.py` | Desktop **camera** GUI (Python + OpenCV) with the same idea. |
 | `pynboids.py` | The original matplotlib boids demo (from *[Python Playground](https://nostarch.com/pythonplayground)* by Mahesh Venkitachalam). |
-| `murmuration_camera.py` | A live **camera** GUI: a white screen full of birds that murmurate freely, and reorganise into the **silhouette of a human** when someone steps in front of the laptop camera. |
 
 ---
 
-## Murmuration Camera
+## Web version (`index.html`)
+
+A flock of birds murmurates on a white web page. Step in front of your webcam
+and the swarm reorganises into your **silhouette**; step away and it melts back
+into free flight. Everything — camera, human segmentation
+([MediaPipe Selfie Segmentation](https://developers.google.com/mediapipe)),
+and the boids — runs **client-side in the browser**. The camera feed never
+leaves the page.
+
+### Run it
+
+The browser only grants camera access on a **secure origin** (`https://` or
+`localhost`). Pick one:
+
+- **GitHub Pages (easiest):** in the repo, *Settings → Pages → Build and
+  deployment → Source: GitHub Actions*. The included workflow publishes the
+  site; then open the Pages URL and click **Enable camera & start**.
+  (Or *Source: Deploy from a branch* → this branch → `/root`.)
+- **Locally:**
+  ```bash
+  python -m http.server 8000
+  # open http://localhost:8000/index.html
+  ```
+
+> Opening `index.html` as a `file://` won't work — the camera and the
+> segmentation library both require it to be served over the web.
+
+### Controls
+
+On-screen buttons (and keys): **Pause** (`Space`), **Formation on/off** (`f`),
+**Preview** the mask (`m`), and a **Birds** slider for the flock size.
+
+---
+
+## Desktop version (`murmuration_camera.py`)
 
 A flock of birds drifts across a white screen in a natural murmuration. Your
 laptop camera watches the room:
