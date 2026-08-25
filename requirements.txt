@@ -1,0 +1,7 @@
+# Core (required)
+numpy>=1.21
+opencv-python>=4.5
+
+# Optional but recommended: gives crisp full-body silhouettes.
+# If missing, the app falls back to background subtraction automatically.
+mediapipe>=0.10 ; python_version < "3.13"
