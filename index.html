@@ -98,7 +98,7 @@
     <button id="pause">Pause</button>
     <button id="form">Formation: on</button>
     <button id="prev">Preview</button>
-    <label>Birds <input id="count" type="range" min="80" max="900" step="20" value="450"></label>
+    <label>Birds <input id="count" type="range" min="80" max="1400" step="20" value="800"></label>
   </div>
 
   <div id="preview"><canvas id="pvcanvas"></canvas></div>
@@ -151,12 +151,12 @@
     W: 0, H: 0,
 
     // tuning
-    sepR: 16, alignR: 42, cohR: 58,
-    sepW: 0.9, alignW: 0.5, cohW: 0.28,
-    maxSpeed: 3.6, maxForce: 0.18,   // gentle steering -> smooth turns
-    cruiseSpeed: 2.2,                // birds glide at a steady pace
-    damping: 0.985,                  // bleeds off twitchy accelerations
-    formForce: 0.5,                  // steering cap while forming a shape
+    sepR: 10, alignR: 55, cohR: 70,  // tight packing, wide alignment = flowing
+    sepW: 0.7, alignW: 0.85, cohW: 0.32,
+    maxSpeed: 3.2, maxForce: 0.14,   // gentle steering -> smooth turns
+    cruiseSpeed: 2.0,                // birds glide at a steady pace
+    damping: 0.98,                   // bleeds off twitchy accelerations
+    formForce: 0.4,                  // steering cap while forming a shape
     arriveR: 45,                     // ease to a stop within this of target
 
     init(n, W, H) {
@@ -183,26 +183,39 @@
 
     resize(W, H) { this.W = W; this.H = H; },
 
-    // targets: Float32Array of interleaved [x,y,...] sampled from silhouette
+    // targets: Float32Array of interleaved [x,y,...] sampled across the
+    // silhouette AREA (interior-heavy).  Assign each bird a DISTINCT point so
+    // the whole shape fills, not just the outline.  Nearest-point assignment
+    // would pull every bird to the closest edge -> hollow outline; instead we
+    // give birds and targets a shared angular order around the shape's centre
+    // and match by rank.  Birds keep their angular position (little crossing =
+    // smooth) while covering every interior point.
     setTargets(pts) {
-      if (!pts || pts.length === 0) { this.hasTarget = false; return; }
+      if (!pts || pts.length < 2) { this.hasTarget = false; return; }
       const m = pts.length / 2;
-      // each bird -> nearest of a random subset of targets (keeps it cheap)
-      const K = Math.min(m, 220);
-      const sx = new Float32Array(K), sy = new Float32Array(K);
-      for (let k = 0; k < K; k++) {
-        const j = (Math.random() * m) | 0;
-        sx[k] = pts[j * 2]; sy[k] = pts[j * 2 + 1];
-      }
-      for (let i = 0; i < this.n; i++) {
-        let best = 0, bd = Infinity;
-        const x = this.px[i], y = this.py[i];
-        for (let k = 0; k < K; k++) {
-          const dx = x - sx[k], dy = y - sy[k];
-          const d = dx * dx + dy * dy;
-          if (d < bd) { bd = d; best = k; }
-        }
-        this.tx[i] = sx[best]; this.ty[i] = sy[best];
+
+      // centroid of the shape
+      let cx = 0, cy = 0;
+      for (let k = 0; k < m; k++) { cx += pts[k * 2]; cy += pts[k * 2 + 1]; }
+      cx /= m; cy /= m;
+
+      // order the target points by angle around the centroid
+      const ta = new Float64Array(m);
+      const tIdx = new Array(m);
+      for (let k = 0; k < m; k++) { ta[k] = Math.atan2(pts[k * 2 + 1] - cy, pts[k * 2] - cx); tIdx[k] = k; }
+      tIdx.sort((a, b) => ta[a] - ta[b]);
+
+      // order the birds by angle around the same centroid
+      const ba = new Float64Array(this.n);
+      const bIdx = new Array(this.n);
+      for (let i = 0; i < this.n; i++) { ba[i] = Math.atan2(this.py[i] - cy, this.px[i] - cx); bIdx[i] = i; }
+      bIdx.sort((a, b) => ba[a] - ba[b]);
+
+      // match rank-for-rank (handles m != n)
+      for (let k = 0; k < this.n; k++) {
+        const bi = bIdx[k];
+        const ti = tIdx[((k * m) / this.n) | 0];
+        this.tx[bi] = pts[ti * 2]; this.ty[bi] = pts[ti * 2 + 1];
       }
       this.hasTarget = true;
     },
@@ -215,7 +228,7 @@
       const cohR2 = this.cohR * this.cohR;
 
       const want = (this.formationOn && this.hasTarget) ? 1 : 0;
-      this.blend += (want - this.blend) * 0.08;
+      this.blend += (want - this.blend) * 0.05;   // slow, smooth assemble/dissolve
       const blend = this.blend;
 
       for (let i = 0; i < n; i++) {
@@ -294,7 +307,7 @@
         let hx = this.vx[i], hy = this.vy[i];
         const sp = Math.hypot(hx, hy) || 1; hx /= sp; hy /= sp;
         const perpx = -hy, perpy = hx;
-        const x = this.px[i], y = this.py[i], s = 4.6;
+        const x = this.px[i], y = this.py[i], s = 3.4;
         const tipx = x + hx * s * 1.7,   tipy = y + hy * s * 1.7;
         const lx = x - hx * s + perpx * s * 0.85, ly = y - hy * s + perpy * s * 0.85;
         const rx = x - hx * s - perpx * s * 0.85, ry = y - hy * s - perpy * s * 0.85;
@@ -343,10 +356,12 @@
     }
 
     const sx = Flock.W / MW, sy = Flock.H / MH;
-    // Fill the whole silhouette: mostly interior points, a light edge
-    // sample just to keep the outline crisp.
-    const nEdge = Math.floor(Flock.n * 0.35);
-    const nFill = Math.floor(Flock.n * 2.5);
+    // `fill` holds every interior pixel, so a uniform pick from it is uniform
+    // over the shape's AREA -> a solid, dense fill.  A light edge sample keeps
+    // the outline crisp.  We hand back a bit more than N points; setTargets
+    // distributes birds across all of them.
+    const nFill = Flock.n;
+    const nEdge = Math.floor(Flock.n * 0.18);
     const out = new Float32Array((nEdge + nFill) * 2);
     let o = 0;
     const draw = (arr, k) => {
@@ -501,7 +516,7 @@
 
   // Draw a gentle idle flock behind the overlay so the page isn't blank.
   resize();
-  Flock.init(300, Flock.W, Flock.H);
+  Flock.init(500, Flock.W, Flock.H);
   (function idle() {
     if (!overlay.classList.contains("hidden")) {
       Flock.step();
