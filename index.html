@@ -160,8 +160,9 @@
     maxSpeed: 5.2, maxForce: 0.55,   // fast, with strong steering = tight turns
     cruiseSpeed: 3.6,                // birds fly at a brisk steady pace
     damping: 0.99,                   // bleeds off twitchy accelerations
-    magK: 0.010,                     // inward pull per sim-px outside the shape
-    maxPull: 0.5,                    // cap on that pull (deep outside)
+    edgeMargin: 34,                  // free-cross band (px) outside the edge: no pull here
+    magK: 0.008,                     // inward pull per sim-px BEYOND the margin
+    maxPull: 0.38,                   // cap on that pull (deep outside)
 
     init(n, W, H) {
       this.W = W; this.H = H;
@@ -275,11 +276,15 @@
               const r = mx < this.fieldW - 1 ? this.field[idx + 1] : d;
               const u = my > 0 ? this.field[idx - this.fieldW] : d;
               const dn = my < this.fieldH - 1 ? this.field[idx + this.fieldW] : d;
-              let gx = l - r, gy = u - dn;
-              const gl = Math.hypot(gx, gy) || 1e-6; gx /= gl; gy /= gl;
               const simD = d * this.W / this.fieldW;            // px outside
-              const pull = Math.min(this.maxPull, this.magK * simD) * blend;
-              ax += gx * pull; ay += gy * pull;
+              // No pull within the free-cross band -> the perimeter is fully
+              // permeable; birds only feel the magnet once well past the edge.
+              if (simD > this.edgeMargin) {
+                let gx = l - r, gy = u - dn;
+                const gl = Math.hypot(gx, gy) || 1e-6; gx /= gl; gy /= gl;
+                const pull = Math.min(this.maxPull, this.magK * (simD - this.edgeMargin)) * blend;
+                ax += gx * pull; ay += gy * pull;
+              }
             }
           }
         }
@@ -311,7 +316,7 @@
     draw(g) {
       const n = this.n, forming = this.formationOn && this.field;
       g.fillStyle = forming ? "#202020" : "#3c3c3c";
-      const r = 2.1, TAU = Math.PI * 2;
+      const r = 4.2, TAU = Math.PI * 2;   // doubled circle size
       g.beginPath();
       for (let i = 0; i < n; i++) {
         const x = this.px[i], y = this.py[i];
