@@ -149,9 +149,10 @@
     blend: 0,
     formationOn: true,
     W: 0, H: 0,
-    // silhouette occupancy: occ[my*occW+mx] === 1 where a bird is inside the
-    // human shape.  cxs/cys is the shape's centroid in simulation space.
-    occ: null, occW: 0, occH: 0, cxs: 0, cys: 0,
+    // Silhouette distance field: field[my*fieldW+mx] = distance (in mask px)
+    // OUTSIDE the human shape, 0 inside.  Birds outside feel a soft inward
+    // pull that grows with this distance -- a magnet, not a wall.
+    field: null, fieldW: 0, fieldH: 0,
 
     // tuning
     sepR: 13, alignR: 55, cohR: 70,  // spread to fill, wide alignment = flowing
@@ -159,8 +160,8 @@
     maxSpeed: 5.2, maxForce: 0.55,   // fast, with strong steering = tight turns
     cruiseSpeed: 3.6,                // birds fly at a brisk steady pace
     damping: 0.99,                   // bleeds off twitchy accelerations
-    formForce: 0.9,                  // strong turn-back at the silhouette edge
-    arriveR: 45,                     // ease to a stop within this of target
+    magK: 0.010,                     // inward pull per sim-px outside the shape
+    maxPull: 0.5,                    // cap on that pull (deep outside)
 
     init(n, W, H) {
       this.W = W; this.H = H;
@@ -185,27 +186,25 @@
 
     resize(W, H) { this.W = W; this.H = H; },
 
-    // Give the flock the human silhouette as an occupancy mask.  The birds
-    // keep flocking freely, but any bird OUTSIDE the shape is steered back in
-    // (see step()), so the whole shape fills with birds actively flying around
-    // inside it -- not parked on an outline.
-    //   occ    : Uint8Array of size occW*occH, 1 = inside the silhouette
-    //   cxm,cym: shape centroid in mask/grid coordinates
-    setMask(occ, occW, occH, cxm, cym) {
-      if (!occ) { this.occ = null; return; }
-      this.occ = occ; this.occW = occW; this.occH = occH;
-      this.cxs = cxm * this.W / occW;   // centroid in simulation space
-      this.cys = cym * this.H / occH;
+    // Give the flock the silhouette as a distance field (0 inside, growing
+    // with distance outside).  Birds fly freely; those outside feel a soft
+    // inward pull that scales with the distance -- a magnet, not a wall.
+    setField(field, w, h) {
+      this.field = field || null; this.fieldW = w; this.fieldH = h;
     },
 
-    // Point-in-silhouette test for a bird at simulation coords (x, y).
-    inside(x, y) {
-      if (!this.occ) return false;
-      const mx = (x * this.occW / this.W) | 0;
-      const my = (y * this.occH / this.H) | 0;
-      if (mx < 0 || mx >= this.occW || my < 0 || my >= this.occH) return false;
-      return this.occ[my * this.occW + mx] === 1;
+    // Distance (mask px) outside the silhouette at simulation coords (x, y);
+    // 0 means inside.  Returns 0 when no field is set.
+    distAt(x, y) {
+      if (!this.field) return 0;
+      const mx = (x * this.fieldW / this.W) | 0;
+      const my = (y * this.fieldH / this.H) | 0;
+      if (mx < 0 || mx >= this.fieldW || my < 0 || my >= this.fieldH) return 1e4;
+      return this.field[my * this.fieldW + mx];
     },
+
+    // Convenience: is a bird inside the shape?
+    inside(x, y) { return this.field != null && this.distAt(x, y) === 0; },
 
     step() {
       const n = this.n;
@@ -214,10 +213,10 @@
       const alignR2 = this.alignR * this.alignR;
       const cohR2 = this.cohR * this.cohR;
 
-      const want = (this.formationOn && this.occ) ? 1 : 0;
+      const want = (this.formationOn && this.field) ? 1 : 0;
       this.blend += (want - this.blend) * 0.05;   // slow, smooth assemble/dissolve
       const blend = this.blend;
-      const contained = blend > 0.01 && this.occ;
+      const contained = blend > 0.01 && this.field;
 
       for (let i = 0; i < n; i++) {
         let sepx = 0, sepy = 0;
@@ -240,48 +239,49 @@
         let ax = clampMag(sepx, sepy, this.maxForce)[0] * this.sepW;
         let ay = clampMag(sepx, sepy, this.maxForce)[1] * this.sepW;
 
-        // Alignment keeps the flock flowing together; cohesion is softened
-        // while contained so birds spread through the shape instead of
-        // clumping at its centre.
-        // Alignment softens while contained so the flock doesn't drift out of
-        // thin limbs as one block; cohesion softens so they don't clump.
+        // Alignment + a little cohesion keep the flock flowing in coherent
+        // groups, so bands of birds bulge across the boundary together and get
+        // drawn back in -- the magnet look.
         if (ac > 0) {
-          const alW = contained ? this.alignW * 0.5 : this.alignW;
           const al = clampMag(avx / ac - vx[i], avy / ac - vy[i], this.maxForce);
-          ax += al[0] * alW; ay += al[1] * alW;
+          ax += al[0] * this.alignW; ay += al[1] * this.alignW;
         }
-        // Cohesion is OFF while contained -- it would pull birds toward the
-        // big torso mass and starve the head/limbs.
-        if (cc > 0 && !contained) {
+        if (cc > 0) {
+          const cohW = contained ? this.cohW * 0.4 : this.cohW;
           const co = clampMag(cx / cc - xi, cy / cc - yi, this.maxForce);
-          ax += co[0] * this.cohW; ay += co[1] * this.cohW;
+          ax += co[0] * cohW; ay += co[1] * cohW;
         }
 
-        // A little wandering while contained helps birds diffuse into every
-        // part of the shape (head, hands, feet) for an even fill.
+        // A little wandering keeps the motion lively and lets birds explore
+        // across the boundary rather than settling.
         if (contained) {
-          ax += (Math.random() - 0.5) * 0.25;
-          ay += (Math.random() - 0.5) * 0.25;
+          ax += (Math.random() - 0.5) * 0.35;
+          ay += (Math.random() - 0.5) * 0.35;
         }
 
-        // CONTAINMENT: birds fly freely, but one that leaves the silhouette is
-        // pushed back into the NEAREST part of the shape (probe the mask around
-        // it) -- so a bird that drifts out of a leg returns to that leg, and
-        // the whole figure (limbs, head) stays populated, not just the torso.
-        if (contained && !this.inside(xi, yi)) {
-          let gx = 0, gy = 0, p = 16;
-          if (this.inside(xi + p, yi)) gx += 1;
-          if (this.inside(xi - p, yi)) gx -= 1;
-          if (this.inside(xi, yi + p)) gy += 1;
-          if (this.inside(xi, yi - p)) gy -= 1;
-          if (this.inside(xi + p, yi + p)) { gx += 0.7; gy += 0.7; }
-          if (this.inside(xi - p, yi + p)) { gx -= 0.7; gy += 0.7; }
-          if (this.inside(xi + p, yi - p)) { gx += 0.7; gy -= 0.7; }
-          if (this.inside(xi - p, yi - p)) { gx -= 0.7; gy -= 0.7; }
-          if (gx === 0 && gy === 0) { gx = this.cxs - xi; gy = this.cys - yi; } // far out -> centroid
-          const d = Math.hypot(gx, gy) || 1e-6;
-          const st = clampMag(gx / d * this.maxSpeed - vx[i], gy / d * this.maxSpeed - vy[i], this.formForce * 1.6);
-          ax += st[0] * blend; ay += st[1] * blend;
+        // MAGNET: soft inward pull that GROWS with how far a bird is outside
+        // the silhouette.  Near the edge it is gentle (birds drift out and
+        // overlap the boundary); the farther out they wander, the harder they
+        // are drawn back -- so they cross the edge and curve home, no hard wall.
+        if (contained) {
+          const mx = (xi * this.fieldW / this.W) | 0;
+          const my = (yi * this.fieldH / this.H) | 0;
+          if (mx >= 0 && mx < this.fieldW && my >= 0 && my < this.fieldH) {
+            const idx = my * this.fieldW + mx;
+            const d = this.field[idx];
+            if (d > 0) {
+              // inward = down the distance gradient (toward smaller distance)
+              const l = mx > 0 ? this.field[idx - 1] : d;
+              const r = mx < this.fieldW - 1 ? this.field[idx + 1] : d;
+              const u = my > 0 ? this.field[idx - this.fieldW] : d;
+              const dn = my < this.fieldH - 1 ? this.field[idx + this.fieldW] : d;
+              let gx = l - r, gy = u - dn;
+              const gl = Math.hypot(gx, gy) || 1e-6; gx /= gl; gy /= gl;
+              const simD = d * this.W / this.fieldW;            // px outside
+              const pull = Math.min(this.maxPull, this.magK * simD) * blend;
+              ax += gx * pull; ay += gy * pull;
+            }
+          }
         }
 
         vx[i] += ax; vy[i] += ay;
@@ -309,7 +309,7 @@
     },
 
     draw(g) {
-      const n = this.n, forming = this.formationOn && this.occ;
+      const n = this.n, forming = this.formationOn && this.field;
       g.fillStyle = forming ? "#202020" : "#3c3c3c";
       const r = 2.1, TAU = Math.PI * 2;
       g.beginPath();
@@ -331,25 +331,48 @@
   }
 
   // ---------------------------------------------------------------
-  // Silhouette -> occupancy mask (a filled region the birds live inside)
+  // Silhouette -> distance field (0 inside, growing with distance outside).
+  // A 2-pass chamfer transform gives a cheap approximate Euclidean distance,
+  // which the flock uses as a soft magnetic well around the shape.
   // ---------------------------------------------------------------
   let coverage = 0;
 
-  function buildOccupancy() {
+  function buildField() {
     const img = maskCtx.getImageData(0, 0, MW, MH).data;
-    const occ = new Uint8Array(MW * MH);
-    let cnt = 0, sx = 0, sy = 0;
-    for (let y = 0; y < MH; y++) {
-      for (let x = 0; x < MW; x++) {
-        // person pixels are white; test the red channel
-        if (img[(y * MW + x) * 4] > 128) {
-          occ[y * MW + x] = 1; cnt++; sx += x; sy += y;
-        }
-      }
+    const INF = 1e9;
+    const d = new Float32Array(MW * MH);
+    let cnt = 0;
+    for (let i = 0; i < MW * MH; i++) {
+      if (img[i * 4] > 128) { d[i] = 0; cnt++; }   // inside person
+      else d[i] = INF;
     }
     coverage = cnt / (MW * MH);
     if (coverage < 0.01) return null;
-    return { occ, w: MW, h: MH, cx: sx / cnt, cy: sy / cnt };
+
+    const A = 1, B = 1.4142136;
+    // forward pass
+    for (let y = 0; y < MH; y++) {
+      for (let x = 0; x < MW; x++) {
+        const i = y * MW + x; let v = d[i];
+        if (x > 0) v = Math.min(v, d[i - 1] + A);
+        if (y > 0) v = Math.min(v, d[i - MW] + A);
+        if (x > 0 && y > 0) v = Math.min(v, d[i - MW - 1] + B);
+        if (x < MW - 1 && y > 0) v = Math.min(v, d[i - MW + 1] + B);
+        d[i] = v;
+      }
+    }
+    // backward pass
+    for (let y = MH - 1; y >= 0; y--) {
+      for (let x = MW - 1; x >= 0; x--) {
+        const i = y * MW + x; let v = d[i];
+        if (x < MW - 1) v = Math.min(v, d[i + 1] + A);
+        if (y < MH - 1) v = Math.min(v, d[i + MW] + A);
+        if (x < MW - 1 && y < MH - 1) v = Math.min(v, d[i + MW + 1] + B);
+        if (x > 0 && y < MH - 1) v = Math.min(v, d[i + MW - 1] + B);
+        d[i] = v;
+      }
+    }
+    return { field: d, w: MW, h: MH };
   }
 
   // ---------------------------------------------------------------
@@ -379,7 +402,7 @@
     ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
     Flock.draw(ctx);
 
-    const forming = Flock.formationOn && Flock.occ;
+    const forming = Flock.formationOn && Flock.field;
     badge.textContent = forming ? "FORMING SILHOUETTE" : "FREE FLIGHT";
     badge.classList.toggle("forming", forming);
     stats.textContent = `birds ${Flock.n} · ${fps.toFixed(0)} fps · body ${(coverage * 100).toFixed(0)}%`;
@@ -402,12 +425,12 @@
     }
     maskCtx.restore();
 
-    // Refresh the silhouette occupancy ~4x/second (responsive to movement,
-    // cheap enough not to hitch).
+    // Refresh the silhouette distance field ~4x/second (responsive to
+    // movement, cheap enough not to hitch).
     if (frame % 15 === 0) {
-      const o = buildOccupancy();
-      if (o) Flock.setMask(o.occ, o.w, o.h, o.cx, o.cy);
-      else Flock.setMask(null);
+      const o = buildField();
+      if (o) Flock.setField(o.field, o.w, o.h);
+      else Flock.setField(null);
     }
 
     if (showPreview) {
