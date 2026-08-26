@@ -156,10 +156,10 @@
     // tuning
     sepR: 13, alignR: 55, cohR: 70,  // spread to fill, wide alignment = flowing
     sepW: 0.9, alignW: 0.85, cohW: 0.32,
-    maxSpeed: 3.2, maxForce: 0.14,   // gentle steering -> smooth turns
-    cruiseSpeed: 2.0,                // birds glide at a steady pace
+    maxSpeed: 5.2, maxForce: 0.55,   // fast, with strong steering = tight turns
+    cruiseSpeed: 3.6,                // birds fly at a brisk steady pace
     damping: 0.99,                   // bleeds off twitchy accelerations
-    formForce: 0.4,                  // steering cap while forming a shape
+    formForce: 0.9,                  // strong turn-back at the silhouette edge
     arriveR: 45,                     // ease to a stop within this of target
 
     init(n, W, H) {
@@ -311,16 +311,12 @@
     draw(g) {
       const n = this.n, forming = this.formationOn && this.occ;
       g.fillStyle = forming ? "#202020" : "#3c3c3c";
+      const r = 2.1, TAU = Math.PI * 2;
       g.beginPath();
       for (let i = 0; i < n; i++) {
-        let hx = this.vx[i], hy = this.vy[i];
-        const sp = Math.hypot(hx, hy) || 1; hx /= sp; hy /= sp;
-        const perpx = -hy, perpy = hx;
-        const x = this.px[i], y = this.py[i], s = 3.4;
-        const tipx = x + hx * s * 1.7,   tipy = y + hy * s * 1.7;
-        const lx = x - hx * s + perpx * s * 0.85, ly = y - hy * s + perpy * s * 0.85;
-        const rx = x - hx * s - perpx * s * 0.85, ry = y - hy * s - perpy * s * 0.85;
-        g.moveTo(tipx, tipy); g.lineTo(lx, ly); g.lineTo(rx, ry); g.closePath();
+        const x = this.px[i], y = this.py[i];
+        g.moveTo(x + r, y);
+        g.arc(x, y, r, 0, TAU);
       }
       g.fill();
     }
