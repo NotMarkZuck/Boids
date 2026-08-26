@@ -152,9 +152,12 @@
 
     // tuning
     sepR: 16, alignR: 42, cohR: 58,
-    sepW: 1.1, alignW: 0.35, cohW: 0.28,
-    maxSpeed: 4.6, maxForce: 0.35,
-    formW: 1.1,
+    sepW: 0.9, alignW: 0.5, cohW: 0.28,
+    maxSpeed: 3.6, maxForce: 0.18,   // gentle steering -> smooth turns
+    cruiseSpeed: 2.2,                // birds glide at a steady pace
+    damping: 0.985,                  // bleeds off twitchy accelerations
+    formForce: 0.5,                  // steering cap while forming a shape
+    arriveR: 45,                     // ease to a stop within this of target
 
     init(n, W, H) {
       this.W = W; this.H = H;
@@ -231,33 +234,47 @@
           cx += px[j]; cy += py[j]; cc++;
         }
 
-        let ax = 0, ay = 0;
-        // separation
-        ax += clampMag(sepx, sepy, this.maxForce)[0] * this.sepW;
-        ay += clampMag(sepx, sepy, this.maxForce)[1] * this.sepW;
-        // alignment
+        // Separation always applies -- it's what spreads the birds so they
+        // FILL the silhouette evenly instead of piling onto a few points.
+        let ax = clampMag(sepx, sepy, this.maxForce)[0] * this.sepW;
+        let ay = clampMag(sepx, sepy, this.maxForce)[1] * this.sepW;
+
+        // Alignment + cohesion (the free-flight murmuration) fade out as the
+        // flock commits to a shape.
+        const flockW = 1 - blend;
         if (ac > 0) {
           const al = clampMag(avx / ac - vx[i], avy / ac - vy[i], this.maxForce);
-          ax += al[0] * this.alignW; ay += al[1] * this.alignW;
+          ax += al[0] * this.alignW * flockW; ay += al[1] * this.alignW * flockW;
         }
-        // cohesion
         if (cc > 0) {
           const co = clampMag(cx / cc - xi, cy / cc - yi, this.maxForce);
-          ax += co[0] * this.cohW; ay += co[1] * this.cohW;
+          ax += co[0] * this.cohW * flockW; ay += co[1] * this.cohW * flockW;
         }
 
-        // formation blend
+        // Formation: steer toward the target with smooth "arrival" -- the
+        // desired speed eases to zero near the point, so birds settle onto
+        // the shape instead of overshooting and jittering.
         if (blend > 0.01 && this.hasTarget) {
-          const st = clampMag(this.tx[i] - xi, this.ty[i] - yi, this.maxForce * 6);
-          ax = ax * (1 - blend) + st[0] * this.formW * blend;
-          ay = ay * (1 - blend) + st[1] * this.formW * blend;
+          const dx = this.tx[i] - xi, dy = this.ty[i] - yi;
+          const dist = Math.hypot(dx, dy) || 1e-6;
+          const desired = Math.min(this.maxSpeed, (dist / this.arriveR) * this.cruiseSpeed);
+          const st = clampMag(dx / dist * desired - vx[i], dy / dist * desired - vy[i], this.formForce);
+          ax += st[0] * blend; ay += st[1] * blend;
         }
 
         vx[i] += ax; vy[i] += ay;
-        // speed limit
+        vx[i] *= this.damping; vy[i] *= this.damping;   // smooth, glide-y motion
+
         let sp = Math.hypot(vx[i], vy[i]);
-        if (sp > this.maxSpeed) { vx[i] = vx[i] / sp * this.maxSpeed; vy[i] = vy[i] / sp * this.maxSpeed; }
-        else if (sp < 0.4) { vx[i] += (Math.random() - 0.5) * 0.5; vy[i] += (Math.random() - 0.5) * 0.5; }
+        if (sp > this.maxSpeed) {
+          vx[i] = vx[i] / sp * this.maxSpeed; vy[i] = vy[i] / sp * this.maxSpeed;
+        } else if (blend < 0.5) {
+          // Free flight: keep a steady cruising speed so they glide like
+          // birds rather than darting. No random jitter.
+          if (sp < 1e-3) { const a = Math.random() * 6.2832; vx[i] = Math.cos(a); vy[i] = Math.sin(a); sp = 1; }
+          const ns = sp + (this.cruiseSpeed - sp) * 0.06;
+          vx[i] = vx[i] / sp * ns; vy[i] = vy[i] / sp * ns;
+        }
       }
 
       // integrate + wrap
@@ -326,8 +343,10 @@
     }
 
     const sx = Flock.W / MW, sy = Flock.H / MH;
-    const nEdge = Math.floor(Flock.n * 2.2);
-    const nFill = Flock.n;
+    // Fill the whole silhouette: mostly interior points, a light edge
+    // sample just to keep the outline crisp.
+    const nEdge = Math.floor(Flock.n * 0.35);
+    const nFill = Math.floor(Flock.n * 2.5);
     const out = new Float32Array((nEdge + nFill) * 2);
     let o = 0;
     const draw = (arr, k) => {
@@ -395,8 +414,9 @@
     }
     maskCtx.restore();
 
-    // Rebuild targets a few times per second.
-    if (frame % 4 === 0) {
+    // Rebuild targets ~4x/second -- responsive to movement without the
+    // per-frame reassignment that made the flock twitch.
+    if (frame % 15 === 0) {
       const pts = sampleTargets();
       Flock.setTargets(pts);
       if (!pts) Flock.hasTarget = false;
