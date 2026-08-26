@@ -146,16 +146,19 @@
   const Flock = {
     n: 0,
     px: null, py: null, vx: null, vy: null,
-    tx: null, ty: null, hasTarget: false, blend: 0,
+    blend: 0,
     formationOn: true,
     W: 0, H: 0,
+    // silhouette occupancy: occ[my*occW+mx] === 1 where a bird is inside the
+    // human shape.  cxs/cys is the shape's centroid in simulation space.
+    occ: null, occW: 0, occH: 0, cxs: 0, cys: 0,
 
     // tuning
-    sepR: 10, alignR: 55, cohR: 70,  // tight packing, wide alignment = flowing
-    sepW: 0.7, alignW: 0.85, cohW: 0.32,
+    sepR: 13, alignR: 55, cohR: 70,  // spread to fill, wide alignment = flowing
+    sepW: 0.9, alignW: 0.85, cohW: 0.32,
     maxSpeed: 3.2, maxForce: 0.14,   // gentle steering -> smooth turns
     cruiseSpeed: 2.0,                // birds glide at a steady pace
-    damping: 0.98,                   // bleeds off twitchy accelerations
+    damping: 0.99,                   // bleeds off twitchy accelerations
     formForce: 0.4,                  // steering cap while forming a shape
     arriveR: 45,                     // ease to a stop within this of target
 
@@ -164,14 +167,13 @@
       this.n = n;
       this.px = new Float32Array(n); this.py = new Float32Array(n);
       this.vx = new Float32Array(n); this.vy = new Float32Array(n);
-      this.tx = new Float32Array(n); this.ty = new Float32Array(n);
       for (let i = 0; i < n; i++) {
         this.px[i] = W * (0.2 + 0.6 * Math.random());
         this.py[i] = H * (0.2 + 0.6 * Math.random());
         const a = Math.random() * Math.PI * 2;
         this.vx[i] = Math.cos(a) * 3; this.vy[i] = Math.sin(a) * 3;
       }
-      this.hasTarget = false; this.blend = 0;
+      this.blend = 0;
     },
 
     setCount(n) {
@@ -183,41 +185,26 @@
 
     resize(W, H) { this.W = W; this.H = H; },
 
-    // targets: Float32Array of interleaved [x,y,...] sampled across the
-    // silhouette AREA (interior-heavy).  Assign each bird a DISTINCT point so
-    // the whole shape fills, not just the outline.  Nearest-point assignment
-    // would pull every bird to the closest edge -> hollow outline; instead we
-    // give birds and targets a shared angular order around the shape's centre
-    // and match by rank.  Birds keep their angular position (little crossing =
-    // smooth) while covering every interior point.
-    setTargets(pts) {
-      if (!pts || pts.length < 2) { this.hasTarget = false; return; }
-      const m = pts.length / 2;
+    // Give the flock the human silhouette as an occupancy mask.  The birds
+    // keep flocking freely, but any bird OUTSIDE the shape is steered back in
+    // (see step()), so the whole shape fills with birds actively flying around
+    // inside it -- not parked on an outline.
+    //   occ    : Uint8Array of size occW*occH, 1 = inside the silhouette
+    //   cxm,cym: shape centroid in mask/grid coordinates
+    setMask(occ, occW, occH, cxm, cym) {
+      if (!occ) { this.occ = null; return; }
+      this.occ = occ; this.occW = occW; this.occH = occH;
+      this.cxs = cxm * this.W / occW;   // centroid in simulation space
+      this.cys = cym * this.H / occH;
+    },
 
-      // centroid of the shape
-      let cx = 0, cy = 0;
-      for (let k = 0; k < m; k++) { cx += pts[k * 2]; cy += pts[k * 2 + 1]; }
-      cx /= m; cy /= m;
-
-      // order the target points by angle around the centroid
-      const ta = new Float64Array(m);
-      const tIdx = new Array(m);
-      for (let k = 0; k < m; k++) { ta[k] = Math.atan2(pts[k * 2 + 1] - cy, pts[k * 2] - cx); tIdx[k] = k; }
-      tIdx.sort((a, b) => ta[a] - ta[b]);
-
-      // order the birds by angle around the same centroid
-      const ba = new Float64Array(this.n);
-      const bIdx = new Array(this.n);
-      for (let i = 0; i < this.n; i++) { ba[i] = Math.atan2(this.py[i] - cy, this.px[i] - cx); bIdx[i] = i; }
-      bIdx.sort((a, b) => ba[a] - ba[b]);
-
-      // match rank-for-rank (handles m != n)
-      for (let k = 0; k < this.n; k++) {
-        const bi = bIdx[k];
-        const ti = tIdx[((k * m) / this.n) | 0];
-        this.tx[bi] = pts[ti * 2]; this.ty[bi] = pts[ti * 2 + 1];
-      }
-      this.hasTarget = true;
+    // Point-in-silhouette test for a bird at simulation coords (x, y).
+    inside(x, y) {
+      if (!this.occ) return false;
+      const mx = (x * this.occW / this.W) | 0;
+      const my = (y * this.occH / this.H) | 0;
+      if (mx < 0 || mx >= this.occW || my < 0 || my >= this.occH) return false;
+      return this.occ[my * this.occW + mx] === 1;
     },
 
     step() {
@@ -227,9 +214,10 @@
       const alignR2 = this.alignR * this.alignR;
       const cohR2 = this.cohR * this.cohR;
 
-      const want = (this.formationOn && this.hasTarget) ? 1 : 0;
+      const want = (this.formationOn && this.occ) ? 1 : 0;
       this.blend += (want - this.blend) * 0.05;   // slow, smooth assemble/dissolve
       const blend = this.blend;
+      const contained = blend > 0.01 && this.occ;
 
       for (let i = 0; i < n; i++) {
         let sepx = 0, sepy = 0;
@@ -252,40 +240,61 @@
         let ax = clampMag(sepx, sepy, this.maxForce)[0] * this.sepW;
         let ay = clampMag(sepx, sepy, this.maxForce)[1] * this.sepW;
 
-        // Alignment + cohesion (the free-flight murmuration) fade out as the
-        // flock commits to a shape.
-        const flockW = 1 - blend;
+        // Alignment keeps the flock flowing together; cohesion is softened
+        // while contained so birds spread through the shape instead of
+        // clumping at its centre.
+        // Alignment softens while contained so the flock doesn't drift out of
+        // thin limbs as one block; cohesion softens so they don't clump.
         if (ac > 0) {
+          const alW = contained ? this.alignW * 0.5 : this.alignW;
           const al = clampMag(avx / ac - vx[i], avy / ac - vy[i], this.maxForce);
-          ax += al[0] * this.alignW * flockW; ay += al[1] * this.alignW * flockW;
+          ax += al[0] * alW; ay += al[1] * alW;
         }
-        if (cc > 0) {
+        // Cohesion is OFF while contained -- it would pull birds toward the
+        // big torso mass and starve the head/limbs.
+        if (cc > 0 && !contained) {
           const co = clampMag(cx / cc - xi, cy / cc - yi, this.maxForce);
-          ax += co[0] * this.cohW * flockW; ay += co[1] * this.cohW * flockW;
+          ax += co[0] * this.cohW; ay += co[1] * this.cohW;
         }
 
-        // Formation: steer toward the target with smooth "arrival" -- the
-        // desired speed eases to zero near the point, so birds settle onto
-        // the shape instead of overshooting and jittering.
-        if (blend > 0.01 && this.hasTarget) {
-          const dx = this.tx[i] - xi, dy = this.ty[i] - yi;
-          const dist = Math.hypot(dx, dy) || 1e-6;
-          const desired = Math.min(this.maxSpeed, (dist / this.arriveR) * this.cruiseSpeed);
-          const st = clampMag(dx / dist * desired - vx[i], dy / dist * desired - vy[i], this.formForce);
+        // A little wandering while contained helps birds diffuse into every
+        // part of the shape (head, hands, feet) for an even fill.
+        if (contained) {
+          ax += (Math.random() - 0.5) * 0.25;
+          ay += (Math.random() - 0.5) * 0.25;
+        }
+
+        // CONTAINMENT: birds fly freely, but one that leaves the silhouette is
+        // pushed back into the NEAREST part of the shape (probe the mask around
+        // it) -- so a bird that drifts out of a leg returns to that leg, and
+        // the whole figure (limbs, head) stays populated, not just the torso.
+        if (contained && !this.inside(xi, yi)) {
+          let gx = 0, gy = 0, p = 16;
+          if (this.inside(xi + p, yi)) gx += 1;
+          if (this.inside(xi - p, yi)) gx -= 1;
+          if (this.inside(xi, yi + p)) gy += 1;
+          if (this.inside(xi, yi - p)) gy -= 1;
+          if (this.inside(xi + p, yi + p)) { gx += 0.7; gy += 0.7; }
+          if (this.inside(xi - p, yi + p)) { gx -= 0.7; gy += 0.7; }
+          if (this.inside(xi + p, yi - p)) { gx += 0.7; gy -= 0.7; }
+          if (this.inside(xi - p, yi - p)) { gx -= 0.7; gy -= 0.7; }
+          if (gx === 0 && gy === 0) { gx = this.cxs - xi; gy = this.cys - yi; } // far out -> centroid
+          const d = Math.hypot(gx, gy) || 1e-6;
+          const st = clampMag(gx / d * this.maxSpeed - vx[i], gy / d * this.maxSpeed - vy[i], this.formForce * 1.6);
           ax += st[0] * blend; ay += st[1] * blend;
         }
 
         vx[i] += ax; vy[i] += ay;
         vx[i] *= this.damping; vy[i] *= this.damping;   // smooth, glide-y motion
 
+        // Keep a steady cruising speed at all times so birds always glide and
+        // fly around -- inside the shape too -- rather than freezing.
         let sp = Math.hypot(vx[i], vy[i]);
         if (sp > this.maxSpeed) {
           vx[i] = vx[i] / sp * this.maxSpeed; vy[i] = vy[i] / sp * this.maxSpeed;
-        } else if (blend < 0.5) {
-          // Free flight: keep a steady cruising speed so they glide like
-          // birds rather than darting. No random jitter.
+        } else {
           if (sp < 1e-3) { const a = Math.random() * 6.2832; vx[i] = Math.cos(a); vy[i] = Math.sin(a); sp = 1; }
-          const ns = sp + (this.cruiseSpeed - sp) * 0.06;
+          const ns = sp + (this.cruiseSpeed - sp) * 0.12;
           vx[i] = vx[i] / sp * ns; vy[i] = vy[i] / sp * ns;
         }
       }
@@ -300,7 +309,7 @@
     },
 
     draw(g) {
-      const n = this.n, forming = this.formationOn && this.hasTarget;
+      const n = this.n, forming = this.formationOn && this.occ;
       g.fillStyle = forming ? "#202020" : "#3c3c3c";
       g.beginPath();
       for (let i = 0; i < n; i++) {
@@ -326,57 +335,25 @@
   }
 
   // ---------------------------------------------------------------
-  // Silhouette -> target points
-  // Reads the mask canvas, keeps outline + interior, maps to scene space.
+  // Silhouette -> occupancy mask (a filled region the birds live inside)
   // ---------------------------------------------------------------
-  let lastPoints = null;
   let coverage = 0;
 
-  function sampleTargets() {
+  function buildOccupancy() {
     const img = maskCtx.getImageData(0, 0, MW, MH).data;
-    // foreground test on red channel (mask drawn as white on black)
-    const fg = (x, y) => img[(y * MW + x) * 4] > 128;
-
-    const edge = [];
-    const fill = [];
-    let fgCount = 0;
-    // step by 2 for speed
-    for (let y = 1; y < MH - 1; y += 2) {
-      for (let x = 1; x < MW - 1; x += 2) {
-        if (!fg(x, y)) continue;
-        fgCount++;
-        const isEdge = !fg(x - 1, y) || !fg(x + 1, y) || !fg(x, y - 1) || !fg(x, y + 1);
-        (isEdge ? edge : fill).push(x, y);
+    const occ = new Uint8Array(MW * MH);
+    let cnt = 0, sx = 0, sy = 0;
+    for (let y = 0; y < MH; y++) {
+      for (let x = 0; x < MW; x++) {
+        // person pixels are white; test the red channel
+        if (img[(y * MW + x) * 4] > 128) {
+          occ[y * MW + x] = 1; cnt++; sx += x; sy += y;
+        }
       }
     }
-    coverage = fgCount / ((MW * MH) / 4);
-    if (coverage < 0.015 || (edge.length === 0 && fill.length === 0)) {
-      lastPoints = null;
-      return null;
-    }
-
-    const sx = Flock.W / MW, sy = Flock.H / MH;
-    // `fill` holds every interior pixel, so a uniform pick from it is uniform
-    // over the shape's AREA -> a solid, dense fill.  A light edge sample keeps
-    // the outline crisp.  We hand back a bit more than N points; setTargets
-    // distributes birds across all of them.
-    const nFill = Flock.n;
-    const nEdge = Math.floor(Flock.n * 0.18);
-    const out = new Float32Array((nEdge + nFill) * 2);
-    let o = 0;
-    const draw = (arr, k) => {
-      const m = arr.length / 2;
-      if (m === 0) return;
-      for (let i = 0; i < k; i++) {
-        const j = (Math.random() * m) | 0;
-        out[o++] = arr[j * 2] * sx;
-        out[o++] = arr[j * 2 + 1] * sy;
-      }
-    };
-    draw(edge, nEdge);
-    draw(fill, nFill);
-    lastPoints = out.subarray(0, o);
-    return lastPoints;
+    coverage = cnt / (MW * MH);
+    if (coverage < 0.01) return null;
+    return { occ, w: MW, h: MH, cx: sx / cnt, cy: sy / cnt };
   }
 
   // ---------------------------------------------------------------
@@ -406,7 +383,7 @@
     ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
     Flock.draw(ctx);
 
-    const forming = Flock.formationOn && Flock.hasTarget;
+    const forming = Flock.formationOn && Flock.occ;
     badge.textContent = forming ? "FORMING SILHOUETTE" : "FREE FLIGHT";
     badge.classList.toggle("forming", forming);
     stats.textContent = `birds ${Flock.n} · ${fps.toFixed(0)} fps · body ${(coverage * 100).toFixed(0)}%`;
@@ -429,12 +406,12 @@
     }
     maskCtx.restore();
 
-    // Rebuild targets ~4x/second -- responsive to movement without the
-    // per-frame reassignment that made the flock twitch.
+    // Refresh the silhouette occupancy ~4x/second (responsive to movement,
+    // cheap enough not to hitch).
     if (frame % 15 === 0) {
-      const pts = sampleTargets();
-      Flock.setTargets(pts);
-      if (!pts) Flock.hasTarget = false;
+      const o = buildOccupancy();
+      if (o) Flock.setMask(o.occ, o.w, o.h, o.cx, o.cy);
+      else Flock.setMask(null);
     }
 
     if (showPreview) {
